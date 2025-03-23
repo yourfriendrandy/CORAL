@@ -15,6 +15,11 @@ Ray-based parallelization
 
 This is the earliest possible version of the project. Documentation, a plethora of ancillary analysis tools, and formal writeups will be added in future commits. The author lost an excruciatingly detailed README less than an hour ago due to the folly of direct web editing and pinky promises to explain everything more very soon. 
 
+HOW TO RUN:
+1. Install dependencies in requirements.txt. They are fairly minimal at present.
+2. I would suggest creating a virtual environment for Ray.
+3. Run completeness_algorithm_master from the project root in your terminal.
+
 Thank you for your interest in this tool! The Collatz conjecture has spawned some wonderfully creative angles of approaching number theory. Hopefully this will be of some use to someone out there.
 
 ---
