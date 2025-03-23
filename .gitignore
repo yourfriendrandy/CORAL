@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+*.log
+.env
+runtime_logs/
+text_output/
+twin_text_output/
+venv/
+*.zip
+.DS_Store
