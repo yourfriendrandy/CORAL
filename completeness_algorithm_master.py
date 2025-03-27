@@ -2,6 +2,8 @@
 import subprocess
 import os
 import time
+
+from config.config import INTEGER_LIMIT, TWIN_ONLY, PARTITION_MODE
 from config.logger import logger, log_resource_usage
 
 # -----------------------------
@@ -10,11 +12,10 @@ from config.logger import logger, log_resource_usage
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 
-LIMIT = "7000000"
-TWIN_ONLY = True
-
-os.environ["INTEGER_LIMIT"] = LIMIT
+# Pass config to subprocesses via environment
+os.environ["INTEGER_LIMIT"] = str(INTEGER_LIMIT)
 os.environ["TWIN_ONLY"] = "true" if TWIN_ONLY else "false"
+os.environ["PARTITION_MODE"] = "true" if PARTITION_MODE else "false"
 
 scripts = [
     "populate_collatz_database.py",
@@ -35,12 +36,13 @@ overall_start_time = time.time()
 
 for script in scripts:
     script_path = os.path.join(SCRIPTS_DIR, script)
-    logger.info(f"🟡 Starting {script} with INTEGER_LIMIT={LIMIT} and TWIN_ONLY={TWIN_ONLY}...")
+    logger.info(f"🟡 Starting {script} with INTEGER_LIMIT={INTEGER_LIMIT}, TWIN_ONLY={TWIN_ONLY}, PARTITION_MODE={PARTITION_MODE}...")
 
     start_time = time.time()
 
+    # Set PYTHONPATH so config modules resolve properly in subprocesses
     os.environ["PYTHONPATH"] = BASE_DIR
-    
+
     result = subprocess.run(["python3", script_path], capture_output=True, text=True, env=os.environ)
     elapsed_time = time.time() - start_time
 
@@ -56,7 +58,7 @@ for script in scripts:
     if result.returncode != 0:
         logger.error(f"❌ {script} failed (exit code {result.returncode})")
         failed_scripts.append(script)
-        break  # Optional: remove if you want to continue running remaining scripts
+        break  # Optional: remove to continue on failure
 
 # -----------------------------
 # Summary

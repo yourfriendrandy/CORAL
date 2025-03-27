@@ -1,8 +1,11 @@
 __pycache__/
+python-3.11/
+.direnv/
 *.pyc
 *.db
 *.log
 .env
+*.envrc
 runtime_logs/
 text_output/
 twin_text_output/

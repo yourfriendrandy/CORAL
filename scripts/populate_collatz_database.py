@@ -2,8 +2,9 @@
 import os
 import ray
 import sqlite3
-from config.config import INTEGER_LIMIT, CHUNK_SIZE, DB_PATH
-from config.db_utils import setup_collatz_db, store_sequences_in_db, connect_db
+import json
+from config.config import INTEGER_LIMIT, CHUNK_SIZE, print_active_mode
+from config.db_utils import setup_collatz_db, connect_db
 
 @ray.remote
 def compute_collatz_batch(chunk):
@@ -17,26 +18,53 @@ def compute_collatz_batch(chunk):
 
     return [(n, collatz_sequence(n)) for n in chunk]
 
-def get_missing_numbers():
-    """Returns all numbers in range [1, INTEGER_LIMIT] that are NOT in the database."""
+def get_existing_numbers():
+    """Returns a set of all numbers currently stored in the database."""
     conn = connect_db("collatz_sequences.db")
     cursor = conn.cursor()
     cursor.execute("SELECT n FROM collatz_cache WHERE n <= ?", (INTEGER_LIMIT,))
     existing = set(row[0] for row in cursor.fetchall())
     conn.close()
+    return existing
 
-    return [n for n in range(1, INTEGER_LIMIT + 1) if n not in existing]
+def store_sequences_in_db(sequences):
+    """Stores a list of (n, sequence) pairs into collatz_cache with optimized batching."""
+    conn = connect_db("collatz_sequences.db")
+    cursor = conn.cursor()
+
+    # Optimized SQLite performance settings
+    cursor.execute("PRAGMA synchronous = OFF;")
+    cursor.execute("PRAGMA journal_mode = WAL;")
+
+    cursor.execute("BEGIN TRANSACTION;")
+    cursor.executemany(
+        'INSERT OR REPLACE INTO collatz_cache (n, sequence) VALUES (?, ?)',
+        [(n, json.dumps(seq)) for n, seq in sequences]
+    )
+    conn.commit()
+    conn.close()
 
 def populate_collatz_db_ray():
+    print_active_mode()
     ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
     setup_collatz_db()
 
-    missing = get_missing_numbers()
+    existing = get_existing_numbers()
+    missing = [n for n in range(1, INTEGER_LIMIT + 1) if n not in existing]
+    
     if not missing:
         print(f"✅ All sequences up to {INTEGER_LIMIT} already exist in the database.")
         return
 
+    # Optional: adaptive chunk sizing (commented out for now)
+    # chunks = []
+    # for i in range(0, len(missing), CHUNK_SIZE):
+    #     scale = min(CHUNK_SIZE, 1000 + (i // 500_000) * 500)
+    #     chunks.append(missing[i:i + scale])
+    
+    # Standard chunking
     chunks = [missing[i:i + CHUNK_SIZE] for i in range(0, len(missing), CHUNK_SIZE)]
+
     print(f"🚀 Starting Ray job for {len(missing)} missing numbers in {len(chunks)} chunks...")
 
     futures = [compute_collatz_batch.remote(chunk) for chunk in chunks]

@@ -5,7 +5,7 @@ from collections import defaultdict, OrderedDict
 
 import ray
 from config.config import (
-    INTEGER_LIMIT, TEXT_OUTPUT_PATH, CACHE_CONFIG
+    INTEGER_LIMIT, TEXT_OUTPUT_PATH, CACHE_CONFIG, TWIN_ONLY, PARTITION_MODE, print_active_mode
 )
 from config.db_utils import connect_db, setup_motif_parameters_db
 
@@ -49,14 +49,12 @@ def collatz_steps(n, lfu_cache):
     cached_sequence = lfu_cache.get(n)
     if cached_sequence:
         return cached_sequence
-
     sequence = []
     original_n = n
     while n > 1:
         sequence.append(n)
         n = n // 2 if n % 2 == 0 else 3 * n + 1
     sequence.append(1)
-
     lfu_cache.put(original_n, sequence)
     return sequence
 
@@ -82,27 +80,20 @@ def find_mode_step_changes(chunk, existing_As):
 def process_motif(A, lfu_cache, seen_motifs):
     A_cycle = collatz_steps(A, lfu_cache)
     product_cycle = collatz_steps(A * 3, lfu_cache)
-
     motif_OE = convert_to_OE(A_cycle)
     product_OE = convert_to_OE(product_cycle)
-
     common_suffix = longest_common_suffix(A_cycle, product_cycle)
     L = common_suffix[0] if common_suffix else None
-
     suffix_index = len(A_cycle) - len(common_suffix) if common_suffix else len(A_cycle)
     motif_OE_prefix = motif_OE[:suffix_index]
-
     product_suffix_index = len(product_OE) - len(common_suffix) if common_suffix else len(product_OE)
     product_OE_prefix = product_OE[:product_suffix_index]
-
     B = motif_OE_prefix.count('E')
     Y = motif_OE_prefix.count('O')
-
     motif_key = (B, Y, motif_OE_prefix)
     if motif_key in seen_motifs:
         return None
     seen_motifs[motif_key] = A
-
     return (A, B, L, Y, motif_OE_prefix, product_OE_prefix)
 
 # -----------------------------
@@ -114,44 +105,79 @@ def write_output_file(filename, content):
         file.write(content)
     print(f"✅ Output saved to {output_file}")
 
+def query_full_mode_integers():
+    """Queries the full set of mode step integers up to INTEGER_LIMIT using the active filter."""
+    conn = connect_db("motif_parameters.db")
+    cursor = conn.cursor()
+    # Apply filtering according to current mode toggles:
+    if TWIN_ONLY:
+        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ? AND B = Y + 1", (INTEGER_LIMIT,))
+    elif PARTITION_MODE:
+        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ? AND B != Y + 1", (INTEGER_LIMIT,))
+    else:
+        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ?", (INTEGER_LIMIT,))
+    all_mode = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    return sorted(all_mode)
+
 # -----------------------------
 # Main Execution
 # -----------------------------
 def main():
+    print_active_mode()
     setup_motif_parameters_db()
     conn = connect_db("motif_parameters.db")
     cursor = conn.cursor()
 
-    cursor.execute("SELECT A FROM motif_parameters")
+    # Resumption: load already-computed A values (up to INTEGER_LIMIT)
+    cursor.execute("SELECT A FROM motif_parameters WHERE A <= ?", (INTEGER_LIMIT,))
     existing_As = {row[0] for row in cursor.fetchall()}
+    if existing_As:
+        print(f"🔎 Resumption Check: {len(existing_As)} motif A values loaded from DB.")
+        print(f"   → Min A: {min(existing_As)}, Max A: {max(existing_As)}")
+    else:
+        print("ℹ️ No existing A values found in DB — full scan will be performed.")
 
-    odd_integers = [i for i in range(1, INTEGER_LIMIT + 1, 2)]
-    chunks = [odd_integers[i:i + 10000] for i in range(0, len(odd_integers), 10000)]
+    # Compute full set of odd integers up to INTEGER_LIMIT
+    all_odds = [i for i in range(1, INTEGER_LIMIT + 1, 2)]
+    # Compute remaining ones not in DB for computation
+    remaining = [i for i in all_odds if i not in existing_As]
+    print(f"🔍 Total odd integers: {len(all_odds)}, remaining for computation: {len(remaining)}")
 
+    chunks = [remaining[i:i + 10000] for i in range(0, len(remaining), 10000)]
     futures = [find_mode_step_changes.remote(chunk, existing_As) for chunk in chunks]
-    result_lists = ray.get(futures)
+    new_mode_integers = [n for sublist in ray.get(futures) for n in sublist]
 
-    mode_integers = [n for sublist in result_lists for n in sublist]
-    print(f"🔍 Found {len(mode_integers)} new mode step integers.")
+    print(f"🔍 Found {len(new_mode_integers)} new mode step integers.")
+    # Full set for output is the union of DB and new integers
+    full_mode_integers = sorted(existing_As.union(new_mode_integers))
+    print(f"🔍 Full set of mode step integers: {len(full_mode_integers)} total (should start with 15).")
 
     lfu_cache = LFUCache(capacity=CACHE_CONFIG["LFU_COLLATZ"])
-    seen_motifs = {}
+    # Load previously stored motif keys for deduplication
+    cursor.execute("SELECT B, Y, motif_OE FROM motif_parameters")
+    seen_motifs = {
+        (row[0], row[1], row[2]): None for row in cursor.fetchall()
+    }
     new_rows = []
-
-    for A in mode_integers:
+    for A in new_mode_integers:
         result = process_motif(A, lfu_cache, seen_motifs)
         if result:
+            A, B, L, Y, motif_OE, product_OE = result
+            motif_key = (B, Y, motif_OE)
+            print(f"✅ Storing motif A0={A} with motif_OE={motif_OE} (B={B}, Y={Y}, L={L})")
             new_rows.append(result)
-
     cursor.executemany('''
         INSERT OR IGNORE INTO motif_parameters (A, B, L, Y, motif_OE, product_OE)
         VALUES (?, ?, ?, ?, ?, ?)
     ''', new_rows)
-
     conn.commit()
     conn.close()
 
-    write_output_file("mode_step_integers.txt", "### Mode Step Integers ###\n\n" + "\n".join(map(str, mode_integers)))
+    # Re-query the full set from the DB using the active filtering mode:
+    full_mode_integers = query_full_mode_integers()
+    output_content = "### Mode Step Integers (Full DB Output) ###\n\n" + "\n".join(map(str, full_mode_integers))
+    write_output_file("mode_step_integers.txt", output_content)
     print("✅ Step 1 complete. Database and text output updated.")
 
 if __name__ == "__main__":

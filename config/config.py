@@ -3,33 +3,52 @@ import os
 # -----------------------------
 # LOCAL OVERRIDE SUPPORT
 # -----------------------------
-# You can set LOCAL_TWIN_ONLY = True/False in any script before importing config.py to override this
 try:
     LOCAL_TWIN_ONLY
 except NameError:
     LOCAL_TWIN_ONLY = None
 
-TWIN_ONLY = LOCAL_TWIN_ONLY if LOCAL_TWIN_ONLY is not None else (
-    os.getenv("TWIN_ONLY", "false").lower() in ("true", "1", "yes")
-)
+try:
+    LOCAL_PARTITION_MODE
+except NameError:
+    LOCAL_PARTITION_MODE = None
 
 # -----------------------------
-# BASE PATHS
+# ENVIRONMENT-BASED FLAGS
 # -----------------------------
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DB_PATH = os.path.join(BASE_DIR, "databases")
-DEFAULT_OUTPUT = os.path.join(BASE_DIR, "text_output")
-TWIN_OUTPUT = os.path.join(BASE_DIR, "twin_text_output")
-TEXT_OUTPUT_PATH = TWIN_OUTPUT if TWIN_ONLY else DEFAULT_OUTPUT
+ENV_TWIN_ONLY = os.getenv("TWIN_ONLY", "false").lower() in ("true", "1", "yes")
+ENV_PARTITION_MODE = os.getenv("PARTITION_MODE", "false").lower() in ("true", "1", "yes")
 
-# Ensure required directories exist
-os.makedirs(DB_PATH, exist_ok=True)
+TWIN_ONLY = False
+PARTITION_MODE = True
+
+# -----------------------------
+# SANITY CHECKER FLAG
+# -----------------------------
+SANITY_CHECKER_ENABLED = False  # Will be updated by GUI
+
+# -----------------------------
+# INTEGER LIMIT
+# -----------------------------
+INTEGER_LIMIT = 5000000
+
+# -----------------------------
+# BASE PATHING
+# -----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+
+# -----------------------------
+# TEXT OUTPUT ROUTING
+# -----------------------------
+if PARTITION_MODE:
+    TEXT_OUTPUT_PATH = os.path.join(ROOT_DIR, "text_output_partition_mode")
+elif TWIN_ONLY:
+    TEXT_OUTPUT_PATH = os.path.join(ROOT_DIR, "text_output_twin_only")
+else:
+    TEXT_OUTPUT_PATH = os.path.join(ROOT_DIR, "text_output_all_motifs")
+
 os.makedirs(TEXT_OUTPUT_PATH, exist_ok=True)
-
-# -----------------------------
-# CONSTANTS
-# -----------------------------
-INTEGER_LIMIT = int(os.getenv("INTEGER_LIMIT", "2000000"))
 
 # -----------------------------
 # BATCH / CHUNK SETTINGS
@@ -40,9 +59,21 @@ CHUNK_SIZE = 10000   # Default number of integers per processing chunk
 # -----------------------------
 # CACHING CONFIGURATION
 # -----------------------------
-# You can adjust these to tune performance and memory usage
 CACHE_CONFIG = {
     "LFU_GENERAL": 5000,
     "LFU_COLLATZ": 1000,
     "LFU_MODE_STEPS": 500,
 }
+
+# -----------------------------
+# MODE CHECK HELPER
+# -----------------------------
+def print_active_mode():
+    """Prints which mode is currently active."""
+    print("⚙️  Output Mode Active:", end=" ")
+    if PARTITION_MODE:
+        print("PARTITION_MODE (non-twin motifs)")
+    elif TWIN_ONLY:
+        print("TWIN_ONLY (B = Y + 1 motifs only)")
+    else:
+        print("ALL motifs (no filtering)")
