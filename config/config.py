@@ -25,7 +25,7 @@ PARTITION_MODE = True
 # -----------------------------
 # SANITY CHECKER FLAG
 # -----------------------------
-SANITY_CHECKER_ENABLED = False  # Will be updated by GUI
+SANITY_CHECK = False  # Will be updated by GUI
 
 # -----------------------------
 # INTEGER LIMIT
