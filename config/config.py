@@ -20,17 +20,17 @@ ENV_TWIN_ONLY = os.getenv("TWIN_ONLY", "false").lower() in ("true", "1", "yes")
 ENV_PARTITION_MODE = os.getenv("PARTITION_MODE", "false").lower() in ("true", "1", "yes")
 
 TWIN_ONLY = False
-PARTITION_MODE = True
+PARTITION_MODE = False
 
 # -----------------------------
 # SANITY CHECKER FLAG
 # -----------------------------
-SANITY_CHECK = False  # Will be updated by GUI
+SANITY_CHECK = False
 
 # -----------------------------
 # INTEGER LIMIT
 # -----------------------------
-INTEGER_LIMIT = 5000000
+INTEGER_LIMIT = 1000000
 
 # -----------------------------
 # BASE PATHING
