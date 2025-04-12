@@ -1,195 +1,130 @@
 #!/usr/bin/env python3
-import sqlite3
 import json
-import os
-import traceback
 import ray
 
 from config.config import (
-    TEXT_OUTPUT_PATH, INTEGER_LIMIT, BATCH_SIZE,
-    TWIN_ONLY, PARTITION_MODE, print_active_mode
+    INTEGER_MAX,
+    F,
+    TWIN_ONLY,
+    PARTITION_MODE,
+    print_active_mode,
 )
-from config.db_utils import connect_db, setup_motif_entry_db, get_project_root
+from config.logger import logger, log_success
+from config.ray_utils import run_ray_futures
+from config.class_utils import PipelineStep
+from config.db_utils import read_duckdb, get_db_paths
+from config.path_utils import get_path
 
 # -----------------------------
-# Ray Initialization
+# Constants
 # -----------------------------
-ray.shutdown()
-ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
-
-# -----------------------------
-# Mode-Based Table Selection
-# -----------------------------
-if TWIN_ONLY:
-    LOOKUP_TABLE = "full_lookup_twin"
-    ENTRY_TABLE = "motif_entry_points_twin"
-elif PARTITION_MODE:
-    LOOKUP_TABLE = "full_lookup_partitioned"
-    ENTRY_TABLE = "motif_entry_points_partitioned"
-else:
-    LOOKUP_TABLE = "full_lookup"
-    ENTRY_TABLE = "motif_entry_points"
+MAX_RANGE = F * INTEGER_MAX
+FULL_LOOKUP_TABLE = (
+    "lookup_twin"
+    if TWIN_ONLY else "lookup_partitioned"
+    if PARTITION_MODE else "lookup"
+)
+MOTIF_INTEGERS_TABLE = "integers"
+SEQUENCE_TABLE = "system_cache"
 
 # -----------------------------
-# Ray Tasks
+# Global variables for Ray task
 # -----------------------------
-@ray.remote
-def fetch_motif_integers():
-    """Fetches all unique motif integers from full_lookup db."""
-    db_path = os.path.join(get_project_root(), "databases", "full_lookup.db")
-    conn = connect_db(db_path)
-    cursor = conn.cursor()
-    motif_integers = set()
-
-    cursor.execute(f"SELECT DISTINCT unique_int FROM {LOOKUP_TABLE} WHERE unique_int <= ?", (INTEGER_LIMIT,))
-    while True:
-        batch = cursor.fetchmany(BATCH_SIZE)
-        if not batch:
-            break
-        motif_integers.update(row[0] for row in batch)
-
-    conn.close()
-    return motif_integers
-
-@ray.remote
-def process_batch(batch, motif_integers):
-    motif_entries = []            # For DB
-    display_entries = []          # For motif_entry_points.txt
-    missing_entries = []          # For missing_entries.txt
-    exceptions_3n2x = []          # For three_n_times_2x_exceptions.txt (now with metadata)
-
-    for n, sequence_json in batch:
-        sequence = json.loads(sequence_json)
-
-        is_form, base_n, X = is_three_n_times_power_of_two(n, return_components=True)
-        entry_step, entered_motif = find_entry_point(sequence, motif_integers)
-
-        if is_form:
-            if entry_step is not None and entered_motif != 4:
-                exceptions_3n2x.append((n, base_n, X, entry_step, entered_motif))
-            else:
-                exceptions_3n2x.append((n, base_n, X, None, None))
-
-        if n not in motif_integers:
-            if entry_step is not None and entered_motif != 4:
-                motif_entries.append((n, entry_step, entered_motif))
-                if not is_form:
-                    display_entries.append((n, entry_step, entered_motif))
-            else:
-                missing_entries.append(n)
-
-    return motif_entries, display_entries, missing_entries, exceptions_3n2x
+known_set = set()
+motif_dict = {}
 
 # -----------------------------
 # Helper Functions
 # -----------------------------
-def find_entry_point(sequence, motif_integers):
-    for step, value in enumerate(sequence):
-        if value in motif_integers:
-            return step, value
-    return None, None
+def get_known_integers():
+    rows = read_duckdb(FULL_LOOKUP_TABLE, as_dict=False)
+    return set(row[0] for row in rows)
 
-def is_three_n_times_power_of_two(n, return_components=False):
-    if n % 3 != 0:
-        return (False, None, None) if return_components else False
-    m = n // 3
-    if m <= 0:
-        return (False, None, None) if return_components else False
+def get_motif_entries():
+    rows = read_duckdb(MOTIF_INTEGERS_TABLE, as_dict=False)
+    return {row[1]: (row[2], row[3], row[4]) for row in rows}  # An → (L, H, T)
 
-    X = 0
-    while m % 2 == 0:
-        m //= 2
-        X += 1
+def load_sequence(n: int):
+    _, duck_path = get_db_paths(SEQUENCE_TABLE)
+    import duckdb
+    with duckdb.connect(duck_path, read_only=True) as conn:
+        result = conn.execute("SELECT sequence FROM system_cache WHERE n = ?", (n,)).fetchone()
+        return json.loads(result[0]) if result else []
 
-    if m % 2 == 1:
-        return (True, m, X) if return_components else True
-    return (False, None, None) if return_components else False
+def classify_convergence(n):
+    seq = load_sequence(n)
+    for i, x in enumerate(seq):
+        if x in known_set:
+            if x in motif_dict:
+                L, H, T = motif_dict[x]
+                if i < L:
+                    return ("before_L", x, i)
+                elif i == L:
+                    return ("at_L", x, i)
+                else:
+                    return ("after_L", x, i)
+            return ("non_motif", x, i)
+        if x in (1, 2, 4):
+            return ("classic_loop", x, i)
+    return ("unresolved", None, len(seq))
 
-def fetch_sequences_in_batches():
-    db_path = os.path.join(get_project_root(), "databases", "collatz_sequences.db")
-    conn = connect_db(db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT n, sequence FROM collatz_cache WHERE n <= ?", (INTEGER_LIMIT,))
-    while True:
-        batch = cursor.fetchmany(BATCH_SIZE)
-        if not batch:
-            break
-        yield batch
-    conn.close()
-
-def store_motif_entries(motif_entries):
-    db_path = os.path.join(get_project_root(), "databases", "motif_entry_points.db")
-    conn = connect_db(db_path)
-    cursor = conn.cursor()
-    cursor.executemany(f'''
-        INSERT OR IGNORE INTO {ENTRY_TABLE} (integer_N, entry_step, entered_motif)
-        VALUES (?, ?, ?)
-    ''', motif_entries)
-    conn.commit()
-    conn.close()
-
-def save_text_output(filename, data, title):
-    file_path = os.path.join(TEXT_OUTPUT_PATH, filename)
-    with open(file_path, "w") as file:
-        file.write(f"### {title} Up to {INTEGER_LIMIT} ###\n\n")
-
-        if not data:
-            file.write("[No entries found]\n")
-            print(f"⚠️  No data for `{title}` — empty file written to `{file_path}`.")
-            return
-
-        if filename == "three_n_times_2x_exceptions.txt":
-            for n, base_n, X, entry_step, entered_motif in data:
-                line = f"{n}: Form (3*{base_n}) * 2^{X}"
-                if entry_step is not None and entered_motif is not None:
-                    line += f" → enters motif at {entered_motif}, step {entry_step}"
-                file.write(line + "\n")
-        elif isinstance(data[0], tuple):
-            for n, entry_step, entered_motif in data:
-                file.write(f"{n}: Entered a motif at integer {entered_motif}, at step {entry_step}\n")
-        else:
-            file.write("\n".join(map(str, data)))
-
-    print(f"✅ {title} saved to `{file_path}`.")
+@ray.remote
+def analyze_missing_batch(batch):
+    return [
+        {
+            "n": n,
+            "converges_to": target,
+            "convergence_type": conv_type,
+            "steps": steps,
+        }
+        for n in batch
+        for conv_type, target, steps in [classify_convergence(n)]
+    ]
 
 # -----------------------------
-# Main Routine
+# Main Driver
 # -----------------------------
-def process_missing_entries():
+@PipelineStep("Analyze missing entry convergence", logger.info)
+def process_missing_entry_analysis():
     print_active_mode()
-    setup_motif_entry_db()
-    print("🔍 Analyzing missing entries with Ray...")
+    ray.init(ignore_reinit_error=True)
 
-    motif_integers = ray.get(fetch_motif_integers.remote())
-    print(f"✅ Pulled {len(motif_integers)} known motif integers from `{LOOKUP_TABLE}`")
-    print(f"ℹ️  First few: {sorted(list(motif_integers))[:10]}")
-    tasks = [process_batch.remote(batch, motif_integers) for batch in fetch_sequences_in_batches()]
-    results = ray.get(tasks)
+    global known_set, motif_dict
+    known_set = get_known_integers()
+    motif_dict = get_motif_entries()
+    full_range = set(range(1, MAX_RANGE + 1))
+    missing = sorted(full_range - known_set)
 
-    all_motif_entries = []
-    all_display_entries = []      # Excludes (3n)*(2^X)
-    all_missing_entries = []
-    all_exceptions = []
+    logger.info(f"🔍 {len(missing)} missing integers out of {MAX_RANGE}")
 
-    for motif_entries, display_entries, missing_entries, exceptions in results:
-        all_motif_entries.extend(motif_entries)
-        all_display_entries.extend(display_entries)
-        all_missing_entries.extend(missing_entries)
-        all_exceptions.extend(exceptions)
+    # Chunk data
+    chunk_size = 1000
+    chunks = [missing[i:i + chunk_size] for i in range(0, len(missing), chunk_size)]
 
-    store_motif_entries(all_motif_entries)
-    save_text_output("motif_entry_points.txt", all_display_entries, "Motif Entry Points (Excludes (3n)*2^X)")
-    save_text_output("missing_entries.txt", all_missing_entries, "Missing Entries")
-    save_text_output("three_n_times_2x_exceptions.txt", all_exceptions, "(3n) * (2^X) Exceptions")
+    results = []
 
-    print("✅ Missing entry analysis complete.")
+    run_ray_futures(
+        chunked_data=chunks,
+        remote_function=analyze_missing_batch,
+        store_callback=lambda chunk_result: results.extend(chunk_result),
+        log_prefix="Missing Entry"
+    )
 
-# -----------------------------
-# Entry Point
-# -----------------------------
+    # Output
+    mode_tag = (
+        "twin_only" if TWIN_ONLY else
+        "partition_mode" if PARTITION_MODE else
+        "default_mode"
+    )
+    output_path = get_path("text_output", "tagged", f"missing_entry_analysis_{mode_tag}.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    logger.info(f"✅ Missing entry analysis complete. Results written to: {output_path}")
+    log_success(f"Coverage: {MAX_RANGE - len(missing)} / {MAX_RANGE} integers mapped.")
+
+# Entrypoint
 if __name__ == "__main__":
-    try:
-        process_missing_entries()
-    except Exception:
-        print("❌ Script crashed!")
-        traceback.print_exc()
+    process_missing_entry_analysis()
+    ray.shutdown()

@@ -1,7 +1,7 @@
 
 def estimate_system_behavior(M, Z):
     M = abs(M)
-    Z = abs(Z)
+    Z = abs(Z) #May not actually be a good descriptor of behavior when M and/or Z are negative
     k = 1
     while M / (Z ** k) >= 1:
         k += 1

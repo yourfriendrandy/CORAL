@@ -6,26 +6,28 @@ import json
 import subprocess
 import sys
 import shutil
-from pathlib import Path
+from config.dicts import DB_MAP, DB_TAG_MAP
 from config.logger import logger
-from config.config import CORAL_TAG, CONFIG_PATH
+from config.config import CORAL_TAG
+from config.path_utils import (
+    get_path, register_output_path, initialize_paths
+)
+
+# --------------------------
+# Initialize dynamic paths
+# --------------------------
+initialize_paths()
 
 # --------------------------
 # Paths + Constants
 # --------------------------
-FACTOR_PATH = Path(f"text_output_{CORAL_TAG}/best_factors_consolidated.json")
-STEP_MODE_PATH = Path(f"text_output/{CORAL_TAG}/step_mode_results.json")
-CHECKPOINT_PATH = Path("checkpoints/f_confirmed.json")
-OUTPUT_DIR = Path(f"text_output_{CORAL_TAG}")
-DB_DIR = Path("databases") / CORAL_TAG
+FACTOR_PATH = get_path("text_output", CORAL_TAG, "best_factors_consolidated.json")
+STEP_MODE_PATH = get_path("text_output", CORAL_TAG, "step_mode_results.json")
+CHECKPOINT_PATH = get_path("checkpoints", "f_confirmed.json")
+OUTPUT_DIR = get_path("text_output", CORAL_TAG)
+DB_DIR = get_path("databases", CORAL_TAG)
 
-MOTIF_DBS = [
-    "motif_parameters.db",
-    "motif_cycles.db",
-    "motif_integers.db",
-    "product_motif_integers.db",
-    "motif_entry_points.db"
-]
+register_output_path("confirmed_factor_checkpoint", CHECKPOINT_PATH)
 
 
 # --------------------------
@@ -39,8 +41,10 @@ def load_json(path):
         logger.error(f"Failed to load {path}: {e}")
         return {}
 
+
 def get_current_config_F():
-    lines = CONFIG_PATH.read_text().splitlines()
+    config_path = get_path("config", "config.py")
+    lines = config_path.read_text().splitlines()
     for line in lines:
         if line.strip().startswith("F ="):
             try:
@@ -49,32 +53,50 @@ def get_current_config_F():
                 return None
     return None
 
+
 def update_config_F(F):
-    lines = CONFIG_PATH.read_text().splitlines()
+    config_path = get_path("config", "config.py")
+    lines = config_path.read_text().splitlines()
     updated = [f"F = {F}  # Confirmed factor" if line.strip().startswith("F =") else line for line in lines]
     if not any(line.strip().startswith("F =") for line in lines):
         updated.append(f"F = {F}  # Confirmed factor")
-    CONFIG_PATH.write_text("\n".join(updated) + "\n")
+    config_path.write_text("\n".join(updated) + "\n")
+
 
 def write_checkpoint_F(F):
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CHECKPOINT_PATH, "w") as f:
         json.dump({"F": F}, f, indent=2)
 
+
 def nuke_old_motif_data():
     preserve_prefixes = {f"{CORAL_TAG}_sequences", f"{CORAL_TAG}_loops"}
-    db_path = Path("databases") / CORAL_TAG
+    motif_files = set()
 
-    if db_path.exists():
-        for db_file in db_path.glob("*.db"):
-            if db_file.stem not in preserve_prefixes:
+    # From DB_MAP
+    for table, info in DB_MAP.items():
+        if info.get("is_motif"):
+            motif_files.add(f"{info['db_name']}.db")
+            motif_files.add(f"{info['db_name']}.duckdb")
+
+    # From DB_TAG_MAP (prefix applies only to .duckdb)
+    for table, info in DB_TAG_MAP.items():
+        if info.get("is_motif"):
+            motif_files.add(f"{info['db_name']}.db")
+            motif_files.add(f"{CORAL_TAG}_{info['db_name']}.duckdb")
+
+    # Nuke motif DBs
+    if DB_DIR.exists():
+        for db_file in DB_DIR.glob("*.db"):
+            if db_file.name in motif_files and db_file.stem not in preserve_prefixes:
                 db_file.unlink()
                 logger.info(f"💣 Deleted DB: {db_file}")
-        for duckdb_file in db_path.glob("*.duckdb"):
-            if duckdb_file.stem not in preserve_prefixes:
+        for duckdb_file in DB_DIR.glob("*.duckdb"):
+            if duckdb_file.name in motif_files and duckdb_file.stem not in preserve_prefixes:
                 duckdb_file.unlink()
                 logger.info(f"💣 Deleted DuckDB: {duckdb_file}")
 
+    # Nuke output dir + checkpoint
     if OUTPUT_DIR.exists():
         shutil.rmtree(OUTPUT_DIR)
         logger.info(f"🧹 Deleted output dir: {OUTPUT_DIR}")
@@ -82,6 +104,7 @@ def nuke_old_motif_data():
     if CHECKPOINT_PATH.exists():
         CHECKPOINT_PATH.unlink()
         logger.info(f"🧹 Deleted checkpoint: {CHECKPOINT_PATH}")
+
 
 # --------------------------
 # GUI Handlers
@@ -102,6 +125,7 @@ def confirm_and_continue(F):
     messagebox.showinfo("Confirmed", f"Factor {F} confirmed.\nContinuing pipeline...")
     root.destroy()
     subprocess.run(["python3", "scripts/populate_CORAL_system.py", "--phase2_resume"])
+
 
 def cancel_pipeline():
     logger.warning("🛑 Factor not confirmed. Pipeline paused.")

@@ -1,121 +1,103 @@
 #!/usr/bin/env python3
-import os
 import json
 import ray
+from itertools import chain
 
-from config.config import TEXT_OUTPUT_PATH, BATCH_SIZE, TWIN_ONLY, PARTITION_MODE, print_active_mode
-from config.db_utils import connect_db, setup_full_lookup_db, get_project_root
+from config.config import (
+    INTEGER_MAX,
+    TWIN_ONLY,
+    PARTITION_MODE,
+    print_active_mode,
+)
+from config.logger import logger
+from config.class_utils import SchemaAwareWriter, PipelineStep
+from config.ray_utils import run_ray_futures
+from config.db_utils import read_duckdb
+from config.path_utils import get_path
 
 # -----------------------------
-# Initialize Ray
+# Ray Task
 # -----------------------------
-ray.shutdown()
-ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
-
 @ray.remote
-def extract_unique_integers_from_cycles(db_name, cycle_table, join_condition, cycle_column):
-    """Extracts unique integers from filtered Collatz cycles."""
-    conn = connect_db(db_name)
-    cursor = conn.cursor()
-
-    root = get_project_root()
-    motif_params_path = os.path.join(root, "databases", "motif_parameters.db")
-    cursor.execute(f"ATTACH DATABASE ? AS mp", (motif_params_path,))
-
-    query = f"""
-        SELECT c.{cycle_column}
-        FROM {cycle_table} c
-        JOIN mp.motif_parameters m ON {join_condition}
-    """
-    if TWIN_ONLY:
-        query += " WHERE m.B = m.Y + 1"
-    elif PARTITION_MODE:
-        query += " WHERE m.B != m.Y + 1"
-
-    cursor.execute(query)
-    unique_ints = set()
-
-    while True:
-        rows = cursor.fetchmany(BATCH_SIZE)
-        if not rows:
-            break
-        for (cycle_json,) in rows:
-            cycle = json.loads(cycle_json)
-            unique_ints.update(cycle)
-
-    conn.close()
-    return unique_ints
-
-def store_unique_integers(unique_integers):
-    """Stores unique integers into appropriate tables in full_lookup.db based on mode."""
-    conn, cursor = setup_full_lookup_db()
-
-    # Always store into the main full_lookup table
-    cursor.executemany(
-        "INSERT OR IGNORE INTO full_lookup (unique_int) VALUES (?)",
-        [(num,) for num in unique_integers]
-    )
-
-    # Additionally store into the filtered subset tables if relevant
-    if TWIN_ONLY:
-        cursor.executemany(
-            "INSERT OR IGNORE INTO full_lookup_twin (unique_int) VALUES (?)",
-            [(num,) for num in unique_integers]
-        )
-    elif PARTITION_MODE:
-        cursor.executemany(
-            "INSERT OR IGNORE INTO full_lookup_partitioned (unique_int) VALUES (?)",
-            [(num,) for num in unique_integers]
-        )
-
-    conn.commit()
-    conn.close()
-    print(f"✅ Stored {len(unique_integers)} integers in `full_lookup` and relevant mode table.")
-
-def write_output_file(unique_integers):
-    """Writes sorted unique integers to a text file based on active mode."""
-    if TWIN_ONLY:
-        filename = "full_lookup_twin_output.txt"
-    elif PARTITION_MODE:
-        filename = "full_lookup_partitioned_output.txt"
-    else:
-        filename = "full_lookup_output.txt"
-
-    output_file = os.path.join(TEXT_OUTPUT_PATH, filename)
-
-    if unique_integers:
-        with open(output_file, "w") as file:
-            file.write("### Full Lookup Output (Sorted Unique Integers) ###\n\n")
-            file.write("\n".join(map(str, sorted(unique_integers))))
-        print(f"📄 Output saved to '{output_file}'.")
-    else:
-        print("⚠️ No unique integers found. Skipping text output.")
+def extract_cycle_integers(chunk: list[tuple[int, str]]) -> list[tuple[int]]:
+    """Ray task to extract unique integers from (n, sequence_json) chunks."""
+    unique = set()
+    for n, json_blob in chunk:
+        try:
+            seq = json.loads(json_blob)
+            unique.update(i for i in seq if i <= 3 * INTEGER_MAX)
+        except Exception:
+            continue
+    return [(val,) for val in unique]
 
 # -----------------------------
-# Main Execution
+# Main Driver
 # -----------------------------
-if __name__ == "__main__":
+@PipelineStep("Generate full_lookup from motif + product cycles", logger.info)
+def process_full_lookup():
     print_active_mode()
-    print("🔁 Starting full lookup with Ray...")
+    ray.init(ignore_reinit_error=True)
 
-    motif_future = extract_unique_integers_from_cycles.remote(
-        "motif_cycles.db",
-        "motif_cycles",
-        "c.motif_integer = m.A",
-        "cycle"
+    # 🧠 Read cycle data
+    motif_cycles = read_duckdb("integer_cycles", as_dict=False)
+    product_cycles = read_duckdb("product_cycles", as_dict=False)
+
+    all_rows = list(chain(motif_cycles, product_cycles))
+
+    def chunkify(lst, size):
+        return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+    chunks = chunkify(all_rows, size=500)
+
+    logger.info(f"📦 Extracting integers from {len(all_rows)} total cycles across motif + product...")
+
+    # 🚀 Run in parallel
+    results = run_ray_futures(
+        chunked_data=chunks,
+        remote_function=extract_cycle_integers,
+        store_callback=None,
+        log_prefix="Full Lookup",
     )
 
-    product_future = extract_unique_integers_from_cycles.remote(
-        "product_motif_cycles.db",
-        "product_motif_cycles",
-        "c.product_N / 3 = m.A",
-        "cycle"
+    # 🧮 Deduplicate + sort
+    all_integers = sorted({val[0] for chunk in results for val in chunk})
+
+    # 📝 Write into all relevant DBs
+    rows = [(val,) for val in all_integers]
+    writers = {
+        "full_lookup": SchemaAwareWriter("lookup"),
+        "full_lookup_twin": SchemaAwareWriter("lookup_twin"),
+        "full_lookup_partitioned": SchemaAwareWriter("lookup_partitioned"),
+    }
+
+    # Always write full set to main lookup table
+    writers["full_lookup"].write_rows(rows)
+
+    # Mode-specific filtered output
+    if TWIN_ONLY:
+        writers["full_lookup_twin"].write_rows(rows)
+    elif PARTITION_MODE:
+        writers["full_lookup_partitioned"].write_rows(rows)
+
+    for w in writers.values():
+        w.close()
+
+    # 📄 Write output file
+    mode_suffix = (
+        "twin_output.txt" if TWIN_ONLY
+        else "partitioned_output.txt" if PARTITION_MODE
+        else "output.txt"
     )
+    output_path = get_path("text_output", "tagged", f"full_lookup_{mode_suffix}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write("### Full Lookup Output (Sorted Unique Integers) ###\n\n")
+        f.write("\n".join(map(str, all_integers)))
 
-    motif_unique, product_unique = ray.get([motif_future, product_future])
-    all_unique = motif_unique.union(product_unique)
+    logger.info(f"📄 Full lookup output written to {output_path}")
+    logger.info("✅ Full lookup generation complete.")
 
-    store_unique_integers(all_unique)
-    write_output_file(all_unique)
-
-    print("✅ Step 6 complete. Data written to `full_lookup.db` and text output.")
+# Entrypoint
+if __name__ == "__main__":
+    process_full_lookup()
+    ray.shutdown()

@@ -1,160 +1,107 @@
 #!/usr/bin/env python3
-import os
 import json
 import ray
-from itertools import chain
 
-from config.config import TEXT_OUTPUT_PATH, CACHE_CONFIG, BATCH_SIZE, TWIN_ONLY, PARTITION_MODE, INTEGER_LIMIT
-from config.db_utils import connect_db, setup_product_motif_cycles_db, get_project_root
+from config.config import INTEGER_MAX, print_active_mode
+from config.logger import logger
+from config.ray_utils import run_ray_futures
+from config.class_utils import SchemaAwareWriter, PipelineStep
+from config.db_utils import (
+    read_duckdb,
+    read_resume_checkpoint,
+    write_resume_checkpoint,
+    port_and_prune_sqlite_to_duckdb,
+)
+from config.path_utils import get_path
 
-# -----------------------------
-# Ray Initialization
-# -----------------------------
-ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
+TABLE_NAME = "product_cycles"
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-def trim_cycle_at_L(cycle, L):
-    if L in cycle:
-        return cycle[: cycle.index(L) + 1]
-    return cycle
-
-def fetch_existing_product_ns():
-    conn = connect_db("product_motif_cycles.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT product_N FROM product_motif_cycles")
-    existing = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    return existing
-
-def fetch_product_motif_integers():
-    conn = connect_db("product_motif_integers.db")
-    cursor = conn.cursor()
-
-    cursor.execute("ATTACH DATABASE ? AS mp", (os.path.join(get_project_root(), "databases", "motif_parameters.db"),))
-
-    query = """
-        SELECT p.motif_A, p.product_N, p.integer_L
-        FROM product_motif_integers p
-        JOIN mp.motif_parameters m ON p.motif_A = m.A
-    """
-
-    if TWIN_ONLY and not PARTITION_MODE:
-        query += " WHERE m.B = m.Y + 1"
-    elif PARTITION_MODE and not TWIN_ONLY:
-        query += " WHERE m.B != m.Y + 1"
-
-    cursor.execute(query)
-
-    while True:
-        rows = cursor.fetchmany(BATCH_SIZE)
-        if not rows:
-            break
-        yield rows
-
-    conn.close()
-
+# ----------------------------------
+# Ray Task: Fetch Collatz Sequences
+# ----------------------------------
 @ray.remote
-def fetch_trimmed_cycles(batch):
-    conn = connect_db("collatz_sequences.db")
-    cursor = conn.cursor()
+def fetch_product_cycles_remote(chunk):
+    from config.db_utils import get_db_paths
+    import duckdb
+    import json
 
-    valid_batch = [row for row in batch if len(row) == 3]
-    if not valid_batch:
-        return {}, []
-
-    product_N_batch = [row[1] for row in valid_batch]
-    placeholders = ','.join(['?'] * len(product_N_batch))
-    query = f"SELECT n, sequence FROM collatz_cache WHERE n IN ({placeholders})"
-
-    cursor.execute(query, product_N_batch)
-    fetched = {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
+    _, duckdb_path = get_db_paths("system_cache")  # → CORAL_TAG_sequences.duckdb
+    conn = duckdb.connect(str(duckdb_path), read_only=True)
+    placeholders = ",".join("?" for _ in chunk)
+    query = f"""
+        SELECT n, sequence FROM system_cache
+        WHERE n IN ({placeholders})
+    """
+    cursor = conn.execute(query, chunk)
+    results = {n: json.loads(seq) for n, seq in cursor.fetchall()}
     conn.close()
+    return results
 
-    trimmed_cycles = {}
-    missing_products = []
+# ----------------------------------
+# Main Driver
+# ----------------------------------
+@PipelineStep("Generate product motif cycles", logger.info)
+def process_product_motif_cycles():
+    print_active_mode()
+    ray.init(ignore_reinit_error=True)
 
-    for _, product_N, integer_L in valid_batch:
-        if product_N in fetched:
-            full_cycle = fetched[product_N]
-            trimmed_cycles[product_N] = trim_cycle_at_L(full_cycle, integer_L)
-        else:
-            missing_products.append(product_N)
+    writer = SchemaAwareWriter(TABLE_NAME)
 
-    return trimmed_cycles, missing_products
+    try:
+        last_seen = read_resume_checkpoint(TABLE_NAME)
+        logger.info(f"🔁 Resuming from product_integer = {last_seen + 1}")
+    except FileNotFoundError:
+        last_seen = -1
 
-def store_cycles(product_cycles):
-    conn = connect_db("product_motif_cycles.db")
-    cursor = conn.cursor()
-    cursor.executemany(
-        "INSERT OR IGNORE INTO product_motif_cycles (product_N, cycle) VALUES (?, ?)",
-        [(k, json.dumps(v)) for k, v in product_cycles.items()]
+    # 📥 Load product integers from DuckDB with mode filtering
+    raw_rows = read_duckdb(
+        table_name="products",
+        where_clause=f"product_An > {last_seen}" if last_seen >= 0 else "",
+        as_dict=True,
+        filter_by_mode=True,
     )
-    conn.commit()
-    conn.close()
+    product_dict = {row["product_An"]: row for row in raw_rows}
+    logger.info(f"🔍 {len(product_dict)} product integers retrieved")
 
-# -----------------------------
-# Main Execution
-# -----------------------------
-def process_product_motif_cycles_ray():
-    print("🚀 Using Ray to process product motif cycles...")
-    setup_product_motif_cycles_db()
+    if not product_dict:
+        logger.info("✅ All product motif integers already processed.")
+        return
 
-    existing_product_ns = fetch_existing_product_ns()
-    print(f"🔎 Skipping {len(existing_product_ns)} already stored product_N values.")
+    # 🧠 Chunking
+    def chunkify(lst, size):
+        return [lst[i:i + size] for i in range(0, len(lst), size)]
 
-    data = [
-        row for row in chain.from_iterable(fetch_product_motif_integers())
-        if row[1] not in existing_product_ns
-    ]
+    chunks = chunkify(list(product_dict.keys()), size=500)
 
-    chunks = [data[i:i + BATCH_SIZE] for i in range(0, len(data), BATCH_SIZE)]
-    futures = [fetch_trimmed_cycles.remote(chunk) for chunk in chunks]
-    results = ray.get(futures)
+    def store_callback(result_dict):
+        rows = [
+            (n, row["H"], row["T"], json.dumps(seq))
+            for n, seq in result_dict.items()
+            if (row := product_dict.get(n))
+        ]
+        writer.write_rows(rows, mode_filtered=True)
 
-    for product_cycles, _ in results:
-        store_cycles(product_cycles)
+    # 🚀 Run Ray
+    run_ray_futures(
+        chunked_data=chunks,
+        remote_function=fetch_product_cycles_remote,
+        store_callback=store_callback,
+        log_prefix="Product Cycle",
+    )
 
-    # Output
-    os.makedirs(TEXT_OUTPUT_PATH, exist_ok=True)
-    output_file = os.path.join(TEXT_OUTPUT_PATH, "product_motif_cycles_output.txt")
+    # 🧼 Finalize
+    last_key = port_and_prune_sqlite_to_duckdb(TABLE_NAME)
+    write_resume_checkpoint(TABLE_NAME, last_key)
 
-    conn = connect_db("product_motif_cycles.db")
-    cursor = conn.cursor()
+    # 📄 Output
+    output_path = get_path("text_output", "tagged", TABLE_NAME + "_output.txt")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(f"✅ Product motif integer cycles written to `{TABLE_NAME}` for up to n = {3 * INTEGER_MAX}\n")
 
-    cursor.execute("ATTACH DATABASE ? AS pmi", (os.path.join(get_project_root(), "databases", "product_motif_integers.db"),))
-    cursor.execute("ATTACH DATABASE ? AS params", (os.path.join(get_project_root(), "databases", "motif_parameters.db"),))
+    logger.info("🎉 Product cycle generation complete.")
 
-    if TWIN_ONLY:
-        filter_clause = "AND m.B = m.Y + 1"
-    elif PARTITION_MODE:
-        filter_clause = "AND m.B != m.Y + 1"
-    else:
-        filter_clause = ""
-
-    cursor.execute(f"""
-        SELECT c.product_N, c.cycle
-        FROM product_motif_cycles c
-        JOIN pmi.product_motif_integers pi ON c.product_N = pi.product_N
-        JOIN params.motif_parameters m ON pi.motif_A = m.A
-        WHERE c.product_N <= ?
-        {filter_clause}
-    """, (3 * INTEGER_LIMIT,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    with open(output_file, "w") as f:
-        f.write("### Product Motif Cycles Output (Trimmed at L) ###\n\n")
-        for product_N, cycle_json in rows:
-            f.write(f"{product_N}: {json.loads(cycle_json)}\n")
-
-        all_missing = list(chain.from_iterable([missing for _, missing in results]))
-        if all_missing:
-            f.write("\n### Missing Collatz Cycles (Not Found in collatz_sequences.db) ###\n")
-            f.write(", ".join(map(str, all_missing)) + "\n")
-
-    print(f"✅ Step 5 complete. {len(data)} new cycles processed. Output written to:\n→ {output_file}")
-
+# Entrypoint
 if __name__ == "__main__":
-    process_product_motif_cycles_ray()
+    process_product_motif_cycles()
+    ray.shutdown()

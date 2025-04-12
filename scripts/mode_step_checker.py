@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+
 import ray
 import json
 from pathlib import Path
 from statistics import mean, stdev
 from collections import Counter
-from config.config import CORAL_TAG, INTEGER_MIN, INTEGER_MAX, F, CHUNK_SIZE
+from config.config import CORAL_TAG, INTEGER_MIN, INTEGER_MAX, CHUNK_SIZE
 from config.logger import logger
 from config.db_utils import read_duckdb
 from config.ray_utils import init_ray
@@ -14,21 +15,22 @@ from config.ray_utils import init_ray
 # -----------------------------
 TABLE = "system_cache"
 OUTPUT_PATH = Path("text_output") / CORAL_TAG / "step_mode_results.json"
+F_PATH = Path("text_output") / CORAL_TAG / "best_factors_consolidated.json"
 
 # -----------------------------
-# Utility
+# Utilities
 # -----------------------------
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
-
 @ray.remote
 def compute_step_deltas(chunk, F):
     keys = {n for n in chunk} | {n * F for n in chunk}
+    where = f"n IN ({','.join(map(str, keys))})"
     row_map = {
         row["n"]: json.loads(row["sequence"])
-        for row in read_duckdb(TABLE, where_clause=f"n IN ({','.join(map(str, keys))})", as_dict=True)
+        for row in read_duckdb(TABLE, where_clause=where, as_dict=True)
     }
 
     deltas = []
@@ -39,30 +41,15 @@ def compute_step_deltas(chunk, F):
             deltas.append(len(seq_f) - len(seq_n))
     return deltas
 
-
-def run_step_mode_analysis():
-    logger.info("🔍 Step Mode Analyzer Started")
-    init_ray()
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    all_ns = list(range(INTEGER_MIN, INTEGER_MAX + 1))
-    chunks = list(chunked(all_ns, CHUNK_SIZE))
-    futures = [compute_step_deltas.remote(chunk, F) for chunk in chunks]
-
-    results = ray.get(futures)
-    all_deltas = [d for sublist in results for d in sublist]
-    logger.info(f"📊 Aggregated {len(all_deltas)} total deltas")
-
-    if not all_deltas:
-        logger.warning("⚠️ No valid deltas computed.")
-        return
-
-    counter = Counter(all_deltas)
+def analyze_deltas(deltas, F):
+    total = len(deltas)
+    counter = Counter(deltas)
     mode, mode_count = counter.most_common(1)[0]
-    total = len(all_deltas)
-    pos, neg, zero = sum(d > 0 for d in all_deltas), sum(d < 0 for d in all_deltas), sum(d == 0 for d in all_deltas)
+    pos = sum(d > 0 for d in deltas)
+    neg = sum(d < 0 for d in deltas)
+    zero = sum(d == 0 for d in deltas)
 
-    result = {
+    return {
         "F": F,
         "total_pairs": total,
         "mode_step_change": mode,
@@ -74,12 +61,46 @@ def run_step_mode_analysis():
         "proportion_positive": pos / total,
         "proportion_negative": neg / total,
         "proportion_zero": zero / total,
-        "mean_step_change": mean(all_deltas),
-        "std_dev_step_change": stdev(all_deltas) if total > 1 else 0.0
+        "mean_step_change": mean(deltas),
+        "std_dev_step_change": stdev(deltas) if total > 1 else 0.0
     }
 
-    OUTPUT_PATH.write_text(json.dumps(result, indent=2))
-    logger.info(f"✅ Step mode results written to: {OUTPUT_PATH}")
+def run_step_mode_analysis():
+    logger.info("🔍 Step Mode Analyzer Started")
+    init_ray()
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load top F values
+    if not F_PATH.exists():
+        raise FileNotFoundError(f"❌ Could not find F summary file at: {F_PATH}")
+    with open(F_PATH) as f:
+        top_factors = json.load(f).get("top_factors", [])
+    F_values = [f["F"] for f in top_factors]
+    if not F_values:
+        raise ValueError("❌ No F values found in top_factors.")
+
+    logger.info(f"📥 Loaded top F values: {F_values}")
+
+    all_ns = list(range(INTEGER_MIN, INTEGER_MAX + 1))
+    chunks = list(chunked(all_ns, CHUNK_SIZE))
+
+    results = []
+    for F in F_values:
+        logger.info(f"📊 Analyzing Δ steps for F = {F}")
+        futures = [compute_step_deltas.remote(chunk, F) for chunk in chunks]
+        delta_lists = ray.get(futures)
+        all_deltas = [d for sublist in delta_lists for d in sublist]
+
+        if not all_deltas:
+            logger.warning(f"⚠️ No deltas found for F = {F}")
+            continue
+
+        stats = analyze_deltas(all_deltas, F)
+        results.append(stats)
+        logger.info(f"✅ Done F = {F}: Mode Δ = {stats['mode_step_change']}, Mean = {stats['mean_step_change']:.3f}")
+
+    OUTPUT_PATH.write_text(json.dumps(results, indent=2))
+    logger.info(f"📄 Saved full results to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

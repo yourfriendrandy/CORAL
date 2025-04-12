@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-import os
 import ray
-import json
-from pathlib import Path
+import argparse
 from config.config import (
-    INTEGER_LIMIT,
-    CHUNK_SIZE,
-    PORT_BATCH_SIZE,
-    print_active_mode,
-    M,
-    Z,
-    CORAL_TAG
+    INTEGER_MIN, INTEGER_MAX, CHUNK_SIZE, PORT_BATCH_SIZE,
+    M, Z, CORAL_TAG, print_active_mode
 )
 from config.logger import logger
 from config.db_utils import (
-    setup_CORAL_db,
-    get_temp_sqlite_path,
-    get_duckdb_path,
+    setup_table,
     port_and_prune_sqlite_to_duckdb,
-    get_last_sqlite_entry,
-    optimized_batch_insert,
-    connect_db,
-    ensure_temp_table_exists_from_duck_schema
+    read_resume_checkpoint, write_resume_checkpoint
 )
+from config.class_utils import SchemaAwareWriter, PipelineStep, DiskLoopTracker
 from config.ray_utils import stream_ray_batches, init_ray
+from config.path_utils import get_path
 
-# === CORAL Sequence Generator ===
-def generate_CORAL_sequence(n, m, z):
-    seq = [n]
-    while n > 1:
+# -----------------------------
+# Argument Parsing
+# -----------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--resume_from_max", action="store_true", help="Resume from INTEGER_MAX checkpoint")
+parser.add_argument("--phase2_resume", action="store_true", help="Resume from F-expanded phase")
+args = parser.parse_args()
+
+# -----------------------------
+# CORAL Sequence Generator
+# -----------------------------
+def generate_CORAL_sequence(n, m, z, entry_points=None):
+    seq, visited = [], set()
+    while True:
+        if n in visited:
+            loop_start = seq.index(n)
+            return seq[:loop_start], seq[loop_start:]
+        if entry_points and n in entry_points:
+            return seq, []
+        visited.add(n)
+        seq.append(n)
         if n % z == 0:
             n //= z
         else:
@@ -36,75 +43,117 @@ def generate_CORAL_sequence(n, m, z):
                 if (m * n + b) % z == 0:
                     n = (m * n + b) // z
                     break
-        seq.append(n)
-    return seq
+            else:
+                raise ValueError(f"Expansion failed at n={n} for m={m}, z={z}")
 
+# -----------------------------
+# Ray Worker
+# -----------------------------
 @ray.remote
-def compute_CORAL_batch(chunk, m, z):
-    return [(n, generate_CORAL_sequence(n, m, z)) for n in chunk]
+def compute_batch_worker(chunk, m, z):
+    writer = SchemaAwareWriter("system_cache", duck=False)
+    loop_tracker = DiskLoopTracker(use_duck=False)
+    entry_points = loop_tracker.get_all_entry_points()
 
-# === Writer ===
-def store_sequences_in_db(sequences):
-    conn = connect_db(get_temp_sqlite_path())
-    data = [(n, json.dumps(seq)) for n, seq in sequences]
-    optimized_batch_insert(conn, "system_cache", data, "(n, sequence)")
-    conn.close()
+    for n in chunk:
+        try:
+            main_seq, loop = generate_CORAL_sequence(n, m, z, entry_points)
+            writer.write_json_rows([(n, main_seq + loop)])
+            if loop:
+                loop_tracker.add_loop_with_entry(loop, main_seq + loop, source_n=n)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed for n={n}: {e}")
 
-# === Main Driver ===
-def populate_coral_db_ray():
+    loop_tracker.close()
+    return True
+
+# -----------------------------
+# Export Infinite Loops
+# -----------------------------
+@PipelineStep("Export infinite loops", logger.info)
+def export_infinite_loops():
+    loop_tracker = DiskLoopTracker()
+    output_path = get_path("text_output", "infinite_loops.txt")
+    loop_tracker.export_all(output_path, system_tag=f"{CORAL_TAG} (M={M}, Z={Z})")
+    loop_tracker.close()
+
+# -----------------------------
+# Get Range of Integers
+# -----------------------------
+@PipelineStep("Determine resume point", logger.info)
+def get_range():
+    from config.config import F  # Deferred import after arg parsing
+
+    if args.resume_from_max:
+        start = read_resume_checkpoint("system_cache") + 1
+        end = INTEGER_MAX
+        logger.info("📍 Phase 1 resume (resume_from_max)")
+
+    elif args.phase2_resume:
+        if INTEGER_MIN <= -1:
+            start = F * INTEGER_MIN
+            end = INTEGER_MIN - 1
+            logger.info(f"📍 Phase 2 resume (lower): {start} → {end}")
+        elif INTEGER_MAX >= 1:
+            start = INTEGER_MAX + 1
+            end = F * INTEGER_MAX
+            logger.info(f"📍 Phase 2 resume (upper): {start} → {end}")
+        else:
+            logger.warning("⚠️ Phase 2 conditions not met — defaulting to main range.")
+            start, end = INTEGER_MIN, INTEGER_MAX
+    else:
+        start, end = INTEGER_MIN, INTEGER_MAX
+        logger.info("📍 Fresh run — full range")
+
+    full_range = (
+        list(range(start, end + 1)) if start <= end
+        else list(range(start, end - 1, -1))
+    )
+    chunks = [full_range[i:i + CHUNK_SIZE] for i in range(0, len(full_range), CHUNK_SIZE)]
+    logger.info(f"📈 Range: {start} to {end}, total chunks: {len(chunks)}")
+    return chunks, end
+
+# -----------------------------
+# Port Callback
+# -----------------------------
+def port_callback():
+    retained = port_and_prune_sqlite_to_duckdb("system_cache")
+    write_resume_checkpoint("system_cache", retained)
+    logger.info(f"📥 Ported up to n = {retained}")
+
+# -----------------------------
+# Pipeline Entry Point
+# -----------------------------
+@PipelineStep("Run CORAL Pipeline", logger.info)
+def populate_coral_db_disk_based():
     print_active_mode()
     init_ray()
+    setup_table("system_cache")
 
-    logger.info(f"🧪 Initializing CORAL system for M={M}, Z={Z} → {CORAL_TAG}")
-    setup_CORAL_db()
+    chunks, end = get_range()
 
-    ensure_temp_table_exists_from_duck_schema("system_cache")
-
-    temp_path = get_temp_sqlite_path()
-    duck_path = get_duckdb_path()
-
-    last_n = get_last_sqlite_entry(temp_path, table="system_cache")
-    start = last_n + 1 if last_n else 1
-    end = 3 * INTEGER_LIMIT
-
-    full_range = list(range(start, end + 1))
-    chunks = [full_range[i:i + CHUNK_SIZE] for i in range(0, len(full_range), CHUNK_SIZE)]
-
-    logger.info(f"📈 Starting from n = {start}, computing up to {end}")
-    logger.info(f"🧠 Porting every {PORT_BATCH_SIZE} batches")
-
-    def port_callback():
-        retained = port_and_prune_sqlite_to_duckdb(
-            sqlite_path=temp_path,
-            duckdb_path=duck_path,
-            table_name="system_cache",
-            key_column="n",
-            logger=logger,
-            delete_sqlite=False
+    @PipelineStep("Sequence generation with Ray", logger.info)
+    def run_ray():
+        stream_ray_batches(
+            chunked_data=chunks,
+            remote_function=compute_batch_worker,
+            remote_args=(M, Z),
+            store_callback=lambda _: logger.info("✅ Chunk complete"),
+            max_in_flight=4,
+            port_every=PORT_BATCH_SIZE,
+            port_callback=port_callback,
+            log_prefix="CORAL"
         )
-        logger.info(f"📦 Ported to DuckDB. Retained n = {retained}")
 
-    stream_ray_batches(
-        chunked_data=chunks,
-        remote_function=lambda chunk: compute_CORAL_batch.remote(chunk, M, Z),
-        store_callback=store_sequences_in_db,
-        max_in_flight=4,
-        port_every=PORT_BATCH_SIZE,
-        port_callback=port_callback,
-        log_prefix="CORAL chunk"
-    )
+    run_ray()
+    port_and_prune_sqlite_to_duckdb("system_cache")
+    export_infinite_loops()
 
-    # Final port and delete temp DB
-    port_and_prune_sqlite_to_duckdb(
-        sqlite_path=temp_path,
-        duckdb_path=duck_path,
-        table_name="system_cache",
-        logger=logger,
-        delete_sqlite=True
-    )
+    logger.info(f"✅ CORAL complete for {CORAL_TAG} — M={M}, Z={Z}, up to n={end}")
 
-    logger.info(f"🎉 CORAL sequence generation complete for {CORAL_TAG} up to n = {end}")
-
+# -----------------------------
+# Entrypoint
+# -----------------------------
 if __name__ == "__main__":
-    populate_coral_db_ray()
+    populate_coral_db_disk_based()
     ray.shutdown()

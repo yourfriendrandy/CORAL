@@ -1,184 +1,146 @@
 #!/usr/bin/env python3
 import os
-import json
-from collections import defaultdict, OrderedDict
-
 import ray
+import json
 from config.config import (
-    INTEGER_LIMIT, TEXT_OUTPUT_PATH, CACHE_CONFIG, TWIN_ONLY, PARTITION_MODE, print_active_mode
+    INTEGER_MIN, INTEGER_MAX, TEXT_OUTPUT_ACTIVE, M, Z, ASSUME_ONE_STEP_REDUCTION, F,
+    TWIN_ONLY, PARTITION_MODE, CHUNK_SIZE
 )
-from config.db_utils import connect_db, setup_motif_parameters_db
-
-ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
-
-# -----------------------------
-# LFU Cache
-# -----------------------------
-class LFUCache:
-    def __init__(self, capacity=None):
-        self.capacity = capacity or CACHE_CONFIG["LFU_GENERAL"]
-        self.cache = {}
-        self.frequency = defaultdict(int)
-        self.order = OrderedDict()
-
-    def get(self, n):
-        if n in self.cache:
-            self.frequency[n] += 1
-            self.order.move_to_end(n)
-            return self.cache[n]
-        return None
-
-    def put(self, n, sequence):
-        if len(self.cache) >= self.capacity:
-            self._evict()
-        self.cache[n] = sequence
-        self.frequency[n] = 1
-        self.order[n] = sequence
-
-    def _evict(self):
-        least_freq = min(self.frequency.values())
-        evict = next(k for k, v in self.frequency.items() if v == least_freq)
-        self.cache.pop(evict)
-        self.frequency.pop(evict)
-        self.order.pop(evict)
+from config.db_utils import (
+    read_duckdb, write_resume_checkpoint, read_resume_checkpoint,
+    port_and_prune_sqlite_to_duckdb, insert_batch, setup_table, connect_db
+)
+from config.class_utils import PipelineStep, SchemaAwareWriter
+from config.logger import logger
 
 # -----------------------------
-# Collatz and Helpers
+# Helpers
 # -----------------------------
-def collatz_steps(n, lfu_cache):
-    cached_sequence = lfu_cache.get(n)
-    if cached_sequence:
-        return cached_sequence
-    sequence = []
-    original_n = n
-    while n > 1:
-        sequence.append(n)
-        n = n // 2 if n % 2 == 0 else 3 * n + 1
-    sequence.append(1)
-    lfu_cache.put(original_n, sequence)
-    return sequence
 
-def convert_to_OE(cycle):
-    return ''.join(['O' if num % 2 else 'E' for num in cycle])
+def convert_to_EC(cycle):
+    return ''.join(['E' if num % 2 else 'C' for num in cycle])
 
 def longest_common_suffix(seq1, seq2):
     min_len = min(len(seq1), len(seq2))
-    i = 1
-    while i <= min_len and seq1[-i] == seq2[-i]:
-        i += 1
-    return seq1[-(i - 1):] if i > 1 else []
+    for i in range(1, min_len + 1):
+        if seq1[-i:] == seq2[-i:]:
+            return seq1[-i:]
+    return []
+
+def check_mode_step_change(n, F, seq_n, seq_f):
+    if ASSUME_ONE_STEP_REDUCTION and len(seq_n) != len(seq_f) + 1:
+        logger.warning(f"❌ Mode step failure: len({n})={len(seq_n)} ≠ len({n*F})+1={len(seq_f)+1}")
+
+def check_convergence_at_L(n, F, seq_n, seq_f):
+    common = longest_common_suffix(seq_n, seq_f)
+    if not common:
+        logger.warning(f"❌ No convergence: {n} and {n*F} do not share a suffix")
+
+# -----------------------------
+# Ray Worker
+# -----------------------------
 
 @ray.remote
-def find_mode_step_changes(chunk, existing_As):
-    lfu_cache = LFUCache(capacity=CACHE_CONFIG["LFU_MODE_STEPS"])
-    return [
-        n for n in chunk
-        if n not in existing_As and
-           len(collatz_steps(n, lfu_cache)) == len(collatz_steps(n * 3, lfu_cache)) + 1
-    ]
+def process_and_insert_motif(n, F, sequence_n, sequence_f):
+    check_mode_step_change(n, F, sequence_n, sequence_f)
+    check_convergence_at_L(n, F, sequence_n, sequence_f)
 
-def process_motif(A, lfu_cache, seen_motifs):
-    A_cycle = collatz_steps(A, lfu_cache)
-    product_cycle = collatz_steps(A * 3, lfu_cache)
-    motif_OE = convert_to_OE(A_cycle)
-    product_OE = convert_to_OE(product_cycle)
-    common_suffix = longest_common_suffix(A_cycle, product_cycle)
-    L = common_suffix[0] if common_suffix else None
-    suffix_index = len(A_cycle) - len(common_suffix) if common_suffix else len(A_cycle)
-    motif_OE_prefix = motif_OE[:suffix_index]
-    product_suffix_index = len(product_OE) - len(common_suffix) if common_suffix else len(product_OE)
-    product_OE_prefix = product_OE[:product_suffix_index]
-    B = motif_OE_prefix.count('E')
-    Y = motif_OE_prefix.count('O')
-    motif_key = (B, Y, motif_OE_prefix)
-    if motif_key in seen_motifs:
+    if ASSUME_ONE_STEP_REDUCTION and len(sequence_n) != len(sequence_f) + 1:
         return None
-    seen_motifs[motif_key] = A
-    return (A, B, L, Y, motif_OE_prefix, product_OE_prefix)
+
+    motif_EC = convert_to_EC(sequence_n)
+    product_EC = convert_to_EC(sequence_f)
+    common = longest_common_suffix(sequence_n, sequence_f)
+    if not common:
+        return None
+
+    L = common[0]
+    prefix_len = len(sequence_n) - len(common)
+    motif_prefix = motif_EC[:prefix_len]
+    product_prefix = product_EC[:len(product_EC) - len(common)]
+    T = motif_prefix.count('C')
+    H = motif_prefix.count('E')
+
+    conn = connect_db("motif_registry")
+    try:
+        insert_batch(conn, "motif_registry", [(T, H, motif_prefix)], "(T, H, motif_EC)", conflict="IGNORE")
+    finally:
+        conn.close()
+
+    return (n, L, H, T, motif_prefix, product_prefix)
 
 # -----------------------------
-# Output Helper
+# Output
 # -----------------------------
+
 def write_output_file(filename, content):
-    output_file = os.path.join(TEXT_OUTPUT_PATH, filename)
-    with open(output_file, "w") as file:
-        file.write(content)
-    print(f"✅ Output saved to {output_file}")
-
-def query_full_mode_integers():
-    """Queries the full set of mode step integers up to INTEGER_LIMIT using the active filter."""
-    conn = connect_db("motif_parameters.db")
-    cursor = conn.cursor()
-    # Apply filtering according to current mode toggles:
-    if TWIN_ONLY:
-        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ? AND B = Y + 1", (INTEGER_LIMIT,))
-    elif PARTITION_MODE:
-        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ? AND B != Y + 1", (INTEGER_LIMIT,))
-    else:
-        cursor.execute("SELECT A FROM motif_parameters WHERE A <= ?", (INTEGER_LIMIT,))
-    all_mode = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    return sorted(all_mode)
+    path = os.path.join(TEXT_OUTPUT_ACTIVE, filename)
+    with open(path, "w") as f:
+        f.write(content)
+    logger.info(f"✅ Output saved to {path}")
 
 # -----------------------------
-# Main Execution
+# Main Pipeline
 # -----------------------------
+
 def main():
-    print_active_mode()
-    setup_motif_parameters_db()
-    conn = connect_db("motif_parameters.db")
-    cursor = conn.cursor()
+    ray.init(ignore_reinit_error=True)
 
-    # Resumption: load already-computed A values (up to INTEGER_LIMIT)
-    cursor.execute("SELECT A FROM motif_parameters WHERE A <= ?", (INTEGER_LIMIT,))
-    existing_As = {row[0] for row in cursor.fetchall()}
-    if existing_As:
-        print(f"🔎 Resumption Check: {len(existing_As)} motif A values loaded from DB.")
-        print(f"   → Min A: {min(existing_As)}, Max A: {max(existing_As)}")
-    else:
-        print("ℹ️ No existing A values found in DB — full scan will be performed.")
+    with PipelineStep("Setup DB + Resume", logger.info):
+        setup_table("motif_registry")
+        writer = SchemaAwareWriter("parameters")
+        existing = {row[0] for row in read_duckdb("parameters", where_clause=f"A <= {INTEGER_MAX}")}
+        resume_point = read_resume_checkpoint("parameters")
 
-    # Compute full set of odd integers up to INTEGER_LIMIT
-    all_odds = [i for i in range(1, INTEGER_LIMIT + 1, 2)]
-    # Compute remaining ones not in DB for computation
-    remaining = [i for i in all_odds if i not in existing_As]
-    print(f"🔍 Total odd integers: {len(all_odds)}, remaining for computation: {len(remaining)}")
+    candidates = [
+        n for n in range(INTEGER_MIN, INTEGER_MAX + 1)
+        if n % Z != 0 and n not in existing and n >= resume_point
+    ]
+    logger.info(f"🧮 Remaining integers: {len(candidates)}")
 
-    chunks = [remaining[i:i + 10000] for i in range(0, len(remaining), 10000)]
-    futures = [find_mode_step_changes.remote(chunk, existing_As) for chunk in chunks]
-    new_mode_integers = [n for sublist in ray.get(futures) for n in sublist]
+    with PipelineStep("Streaming motif detection", logger.info):
+        for i in range(0, len(candidates), CHUNK_SIZE):
+            batch = candidates[i:i + CHUNK_SIZE]
+            keys = batch + [n * F for n in batch]
 
-    print(f"🔍 Found {len(new_mode_integers)} new mode step integers.")
-    # Full set for output is the union of DB and new integers
-    full_mode_integers = sorted(existing_As.union(new_mode_integers))
-    print(f"🔍 Full set of mode step integers: {len(full_mode_integers)} total (should start with 15).")
+            # 🔁 Load all required sequences in one DuckDB read
+            rows = read_duckdb("system_cache", where_clause=f"n IN ({','.join(map(str, keys))})", as_dict=True)
+            sequence_map = {row["n"]: json.loads(row["sequence"]) for row in rows}
 
-    lfu_cache = LFUCache(capacity=CACHE_CONFIG["LFU_COLLATZ"])
-    # Load previously stored motif keys for deduplication
-    cursor.execute("SELECT B, Y, motif_OE FROM motif_parameters")
-    seen_motifs = {
-        (row[0], row[1], row[2]): None for row in cursor.fetchall()
-    }
-    new_rows = []
-    for A in new_mode_integers:
-        result = process_motif(A, lfu_cache, seen_motifs)
-        if result:
-            A, B, L, Y, motif_OE, product_OE = result
-            motif_key = (B, Y, motif_OE)
-            print(f"✅ Storing motif A0={A} with motif_OE={motif_OE} (B={B}, Y={Y}, L={L})")
-            new_rows.append(result)
-    cursor.executemany('''
-        INSERT OR IGNORE INTO motif_parameters (A, B, L, Y, motif_OE, product_OE)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', new_rows)
-    conn.commit()
-    conn.close()
+            valid = [
+                n for n in batch
+                if n in sequence_map and n * F in sequence_map and
+                (not ASSUME_ONE_STEP_REDUCTION or len(sequence_map[n]) == len(sequence_map[n * F]) + 1)
+            ]
 
-    # Re-query the full set from the DB using the active filtering mode:
-    full_mode_integers = query_full_mode_integers()
-    output_content = "### Mode Step Integers (Full DB Output) ###\n\n" + "\n".join(map(str, full_mode_integers))
-    write_output_file("mode_step_integers.txt", output_content)
-    print("✅ Step 1 complete. Database and text output updated.")
+            futures = [
+                process_and_insert_motif.remote(n, F, sequence_map[n], sequence_map[n * F])
+                for n in valid
+            ]
+
+            results = ray.get(futures)
+            new_rows = [res for res in results if res is not None]
+            writer.write_rows(new_rows)
+            write_resume_checkpoint("parameters", batch[-1])
+
+    writer.close()
+
+    with PipelineStep("Sync to DuckDB", logger.info):
+        retained = port_and_prune_sqlite_to_duckdb("parameters")
+        write_resume_checkpoint("parameters", retained)
+
+    with PipelineStep("Write output file", logger.info):
+        where_clause = f"A <= {INTEGER_MAX}"
+        if TWIN_ONLY:
+            where_clause += " AND (T = H + 1)"
+        elif PARTITION_MODE:
+            where_clause += " AND (T != H + 1)"
+        filtered = read_duckdb("parameters", where_clause=where_clause)
+        content = "### Mode Step Integers ###\n\n" + "\n".join(str(row[0]) for row in filtered)
+        write_output_file("mode_step_integers.txt", content)
+
+    logger.info("🎉 Motif discovery complete.")
+
 
 if __name__ == "__main__":
     main()

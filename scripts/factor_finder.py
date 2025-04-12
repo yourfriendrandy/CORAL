@@ -1,65 +1,54 @@
 #!/usr/bin/env python3
-import json
+
+import os
 import ray
+import json
 import subprocess
-from pathlib import Path
 from math import gcd
+from pathlib import Path
 from config.config import (
-    INTEGER_MIN, INTEGER_MAX, M, Z, CORAL_TAG
+    INTEGER_MIN, INTEGER_MAX, M, Z, CORAL_TAG, CHUNK_SIZE
 )
 from config.logger import logger
 from config.ray_utils import init_ray
-from config.db_utils import read_duckdb_table_as_dict
+from config.db_utils import read_duckdb  # If needed
 
 # -----------------------------
-# One-time Marker System
-# -----------------------------
-import os
-MARKER_DIR = Path(".metadata")
-MARKER_DIR.mkdir(exist_ok=True)
-MARKER_FILE = MARKER_DIR / f"{CORAL_TAG}_init_done.flag"
-FORCE_INIT = os.getenv("FORCE_INIT", "false").lower() == "true"
-
-if MARKER_FILE.exists() and not FORCE_INIT:
-    print(f"[💤] Initialization already completed for {CORAL_TAG}. Skipping factor_finder.")
-    exit(0)
-
-# -----------------------------
-# Settings
+# Constants
 # -----------------------------
 F_CANDIDATES = list(range(M, M * M + 1))
 TOP_K = 3
 DUCKDB_TABLE = "system_cache"
-FACTOR_JSON = Path(f"text_output_{CORAL_TAG}") / "best_factors_consolidated.json"
 CONFIG_PATH = Path("config") / "config.py"
+OUTPUT_DIR = Path("text_output") / CORAL_TAG
+OUTPUT_PATH = OUTPUT_DIR / "best_factors_consolidated.json"
+MARKER_DIR = Path(".metadata")
+MARKER_FILE = MARKER_DIR / f"{CORAL_TAG}_init_done.flag"
+
 LOW_RANGE = range(INTEGER_MIN, INTEGER_MAX // 10 + 1)
 FULL_RANGE = range(INTEGER_MIN, INTEGER_MAX + 1)
-CHUNK_SIZE = 10000
 
-AUTO_RESUME = False  # Optional toggle
+AUTO_RESUME = False
+FORCE_INIT = os.getenv("FORCE_INIT", "false").lower() == "true"
+
 
 # -----------------------------
 # Utilities
 # -----------------------------
 def chunked(seq, size):
-    return [seq[i:i + size] for i in range(0, len(seq), size)]
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
 
 @ray.remote
 def fetch_and_compare(ns, F, Z):
-    from config.db_utils import read_duckdb_table_as_dict
-    import json
+    targets = {n for n in ns if n % Z != 0}
+    targets |= {n * F for n in targets}
 
-    n_set = set()
-    for n in ns:
-        if n % Z == 0:
-            continue
-        n_set.add(n)
-        n_set.add(n * F)
+    sequence_map = {row["n"]: json.loads(row["sequence"])
+                    for row in read_duckdb(DUCKDB_TABLE, where_clause=f"n IN ({','.join(map(str, targets))})", as_dict=True)}
 
-    sequence_map = read_duckdb_table_as_dict(DUCKDB_TABLE, column="n", keys=list(n_set))
-    short_deltas = 0
-    total = 0
-
+    total, short_deltas = 0, 0
     for n in ns:
         if n % Z == 0 or (n * F) % Z == 0:
             continue
@@ -75,93 +64,79 @@ def fetch_and_compare(ns, F, Z):
 
     return short_deltas, total
 
-def update_config_file(selected_F: int):
-    with open(CONFIG_PATH, "r") as f:
-        lines = f.readlines()
-
-    with open(CONFIG_PATH, "w") as f:
-        found = False
-        for line in lines:
-            if line.strip().startswith("F ="):
-                f.write(f"F = {selected_F}  # Selected best factor for this CORAL run\n")
-                found = True
-            else:
-                f.write(line)
-        if not found:
-            f.write(f"\nF = {selected_F}  # Selected best factor for this CORAL run\n")
-    logger.info(f"🧪 Updated F = {selected_F} in config.py")
 
 def stream_f_deltas(F, Z, ns, label=""):
     short, total = 0, 0
-    chunks = chunked(ns, CHUNK_SIZE)
-
-    for i, chunk in enumerate(chunks, 1):
-        future = fetch_and_compare.remote(chunk, F, Z)
-        s, t = ray.get(future)
+    for i, chunk in enumerate(chunked(ns, CHUNK_SIZE), 1):
+        s, t = ray.get(fetch_and_compare.remote(chunk, F, Z))
         short += s
         total += t
-        logger.info(f"[{label}] Chunk {i}/{len(chunks)} → Δ≤3: {s}, Total: {t}")
-
+        logger.info(f"[{label}] Chunk {i} → Δ≤3: {s}, Total: {t}")
     return short, total
 
+
+def update_config_file(selected_F: int):
+    lines = Path(CONFIG_PATH).read_text().splitlines()
+    updated = [f"F = {selected_F}  # Auto-selected best factor" if line.strip().startswith("F =") else line for line in lines]
+    if not any(line.startswith("F =") for line in lines):
+        updated.append(f"F = {selected_F}  # Auto-selected best factor")
+    Path(CONFIG_PATH).write_text("\n".join(updated) + "\n")
+    logger.info(f"🧪 Updated F = {selected_F} in config.py")
+
+
+def run_auto_resume(best_F: int):
+    update_config_file(best_F)
+    logger.info(f"🚀 Auto-resuming with F = {best_F}")
+    subprocess.run(["python3", "scripts/populate_CORAL_system.py", "--resume_from_max"])
+
+
 # -----------------------------
-# Main Execution
+# Main Entry
 # -----------------------------
 def factor_finder_streamed():
+    if MARKER_FILE.exists() and not FORCE_INIT:
+        print(f"[💤] Initialization already completed for {CORAL_TAG}. Skipping factor_finder.")
+        return
+
     logger.info("🔎 Streaming-safe factor analysis started...")
     init_ray()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    MARKER_DIR.mkdir(parents=True, exist_ok=True)
 
-    factor_scores = []
-
+    scores = []
     for F in F_CANDIDATES:
         if gcd(F, Z) != 1:
             continue
-        logger.info(f"🔧 Processing F = {F}...")
 
+        logger.info(f"🔧 Testing F = {F}...")
         low_short, low_total = stream_f_deltas(F, Z, LOW_RANGE, label="LOW")
         full_short, full_total = stream_f_deltas(F, Z, FULL_RANGE, label="FULL")
 
-        if full_total == 0 or low_total == 0:
-            logger.warning(f"⚠️ Skipping F = {F}: insufficient data.")
+        if low_total == 0 or full_total == 0:
+            logger.warning(f"⚠️ Insufficient data for F = {F}")
             continue
 
         low_ratio = low_short / low_total
         full_ratio = full_short / full_total
         score = full_ratio - low_ratio
 
-        logger.info(f"✅ F = {F} → Δscore: {score:.5f}, low: {low_ratio:.4f}, full: {full_ratio:.4f}")
-
-        factor_scores.append({
-            "F": F,
-            "score": score,
-            "low_ratio": low_ratio,
-            "full_ratio": full_ratio
+        logger.info(f"✅ F = {F} Δscore: {score:.5f}, LOW: {low_ratio:.4f}, FULL: {full_ratio:.4f}")
+        scores.append({
+            "F": F, "score": score,
+            "low_ratio": low_ratio, "full_ratio": full_ratio
         })
 
-    factor_scores.sort(key=lambda x: x["score"], reverse=True)
-    top_factors = factor_scores[:TOP_K]
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    top_k = scores[:TOP_K]
+    OUTPUT_PATH.write_text(json.dumps({"top_factors": top_k}, indent=2))
+    logger.info(f"📊 Top F scores saved to {OUTPUT_PATH}")
 
-    out_dir = Path(f"text_output_{CORAL_TAG}")
-    out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / "best_factors_consolidated.json"
+    MARKER_FILE.touch()
 
-    with open(out_path, "w") as f:
-        json.dump({"top_factors": top_factors}, f, indent=2)
-
-    logger.info(f"📊 Top F scores saved to {out_path}")
-
-    if not MARKER_FILE.exists():
-        MARKER_FILE.touch()
-
-    if AUTO_RESUME and top_factors:
-        best_F = top_factors[0]["F"]
-        update_config_file(best_F)
-        logger.info(f"🚀 Auto-resuming with F = {best_F}")
-        subprocess.run(["python3", "scripts/populate_CORAL_system.py", "--resume_from_max"])
+    if AUTO_RESUME and top_k:
+        run_auto_resume(top_k[0]["F"])
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
 if __name__ == "__main__":
     factor_finder_streamed()
+    ray.shutdown()

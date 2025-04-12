@@ -1,143 +1,109 @@
 #!/usr/bin/env python3
-import os
 import json
 import ray
 
-from config.config import (
-    TEXT_OUTPUT_PATH,
-    INTEGER_LIMIT,
-    TWIN_ONLY,
-    PARTITION_MODE,
-    print_active_mode
+from config.config import INTEGER_MAX, print_active_mode
+from config.logger import logger
+from config.ray_utils import run_ray_futures
+from config.class_utils import SchemaAwareWriter, PipelineStep
+from config.db_utils import (
+    read_duckdb,
+    read_resume_checkpoint,
+    write_resume_checkpoint,
+    port_and_prune_sqlite_to_duckdb,
 )
-from config.db_utils import connect_db, setup_motif_cycles_db, get_project_root
+from config.path_utils import get_path
 
-# Initialize Ray
-ray.init(ignore_reinit_error=True, num_cpus=os.cpu_count() - 1)
+TABLE_NAME = "integer_cycles"
 
-BATCH_SIZE = 1000
-
-def get_existing_motif_cycles():
-    conn = connect_db("motif_cycles.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT motif_integer FROM motif_cycles")
-    existing = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    return existing
-
-def fetch_motif_integers(limit, exclude_set):
-    conn = connect_db("motif_cycles.db")
-    cursor = conn.cursor()
-
-    root = get_project_root()
-    motif_params_path = os.path.join(root, "databases", "motif_parameters.db")
-    motif_integers_path = os.path.join(root, "databases", "motif_integers.db")
-
-    cursor.execute("ATTACH DATABASE ? AS mi", (motif_integers_path,))
-    cursor.execute("ATTACH DATABASE ? AS params", (motif_params_path,))
-
-    if TWIN_ONLY:
-        filter_clause = "AND p.B = p.Y + 1"
-    elif PARTITION_MODE:
-        filter_clause = "AND p.B != p.Y + 1"
-    else:
-        filter_clause = ""
-
-    query = f"""
-        SELECT m.integer_N
-        FROM mi.motif_integers m
-        JOIN params.motif_parameters p ON m.motif_A = p.A
-        WHERE m.integer_N <= ?
-        {filter_clause}
-    """
-
-    cursor.execute(query, (limit,))
-    all_ints = [row[0] for row in cursor.fetchall()]
-    conn.close()
-
-    return [n for n in all_ints if n not in exclude_set]
-
+# ----------------------------------
+# Ray Task: Fetch Collatz Sequences
+# ----------------------------------
 @ray.remote
-def fetch_collatz_cycles_chunk(chunk):
-    conn = connect_db("collatz_sequences.db")
-    cursor = conn.cursor()
-    query = f"SELECT n, sequence FROM collatz_cache WHERE n IN ({','.join('?' * len(chunk))})"
-    cursor.execute(query, chunk)
-    result = {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
-    conn.close()
-    return result
+def fetch_cycles_remote(chunk):
+    from config.db_utils import get_db_paths
+    import duckdb
+    import json
 
-def store_motif_cycles_bulk(motif_cycles):
-    conn = connect_db("motif_cycles.db")
-    cursor = conn.cursor()
-    cursor.executemany('''
-        INSERT OR IGNORE INTO motif_cycles (motif_integer, cycle)
-        VALUES (?, ?)
-    ''', [(n, json.dumps(seq)) for n, seq in motif_cycles.items()])
-    conn.commit()
+    _, duckdb_path = get_db_paths("system_cache")  # Resolves to {CORAL_TAG}_sequences.duckdb
+    conn = duckdb.connect(str(duckdb_path), read_only=True)
+    placeholders = ",".join("?" for _ in chunk)
+    query = f"""
+        SELECT n, sequence FROM system_cache
+        WHERE n IN ({placeholders})
+    """
+    cursor = conn.execute(query, chunk)
+    results = {n: json.loads(seq) for n, seq in cursor.fetchall()}
     conn.close()
+    return results
 
-def process_motif_cycles_ray():
+# ----------------------------------
+# Main Driver
+# ----------------------------------
+@PipelineStep("Generate motif integer cycles", logger.info)
+def process_motif_cycles():
     print_active_mode()
-    print("⚡ Initializing motif cycle generation using Ray...")
-    setup_motif_cycles_db()
+    ray.init(ignore_reinit_error=True)
 
-    already_processed = get_existing_motif_cycles()
-    motif_integers = fetch_motif_integers(INTEGER_LIMIT, already_processed)
-    chunks = [motif_integers[i:i + BATCH_SIZE] for i in range(0, len(motif_integers), BATCH_SIZE)]
+    # 🛠️ Writer only (tables already set up globally)
+    writer = SchemaAwareWriter(TABLE_NAME)
 
-    print(f"🔍 Found {len(motif_integers)} unprocessed motif integers, split into {len(chunks)} chunks.")
+    # 🔁 Resume support
+    try:
+        last_seen = read_resume_checkpoint(TABLE_NAME)
+        logger.info(f"🔁 Resuming from motif_integer = {last_seen + 1}")
+    except FileNotFoundError:
+        last_seen = -1
 
-    futures = [fetch_collatz_cycles_chunk.remote(chunk) for chunk in chunks]
+    # 📥 Load motif integers from DuckDB with mode filtering
+    raw_rows = read_duckdb(
+        table_name="integers",
+        where_clause=f"integer_An > {last_seen}" if last_seen >= 0 else "",
+        as_dict=True,
+        filter_by_mode=True,
+    )
+    motif_dict = {row["integer_An"]: row for row in raw_rows}
+    logger.info(f"🔍 {len(motif_dict)} motif integers retrieved")
 
-    os.makedirs(TEXT_OUTPUT_PATH, exist_ok=True)
-    output_file = os.path.join(TEXT_OUTPUT_PATH, "motif_cycles_output.txt")
-    missing_motifs = []
+    if not motif_dict:
+        logger.info("✅ All motif integers already processed.")
+        return
 
-    with open(output_file, "w") as file:
-        file.write("### Motif Cycles Output ###\n\n")
+    # 🧠 Chunking
+    def chunkify(lst, size):
+        return [lst[i:i + size] for i in range(0, len(lst), size)]
 
-        for chunk, future in zip(chunks, futures):
-            result = ray.get(future)
-            store_motif_cycles_bulk(result)
+    chunked = chunkify(list(motif_dict.keys()), size=500)
 
-        # Re-query for output
-        conn = connect_db("motif_cycles.db")
-        cursor = conn.cursor()
+    def store_callback(result_dict):
+        rows = [
+            (n, row["H"], row["T"], json.dumps(seq))
+            for n, seq in result_dict.items()
+            if (row := motif_dict.get(n))
+        ]
+        writer.write_rows(rows, mode_filtered=True)
 
-        root = get_project_root()
-        motif_params_path = os.path.join(root, "databases", "motif_parameters.db")
-        motif_integers_path = os.path.join(root, "databases", "motif_integers.db")
+    # 🚀 Parallel collection
+    run_ray_futures(
+        chunked_data=chunked,
+        remote_function=fetch_cycles_remote,
+        store_callback=store_callback,
+        log_prefix="Motif Cycle",
+    )
 
-        cursor.execute("ATTACH DATABASE ? AS mi", (motif_integers_path,))
-        cursor.execute("ATTACH DATABASE ? AS params", (motif_params_path,))
+    # 🧼 Finalize + checkpoint
+    last_key = port_and_prune_sqlite_to_duckdb(TABLE_NAME)
+    write_resume_checkpoint(TABLE_NAME, last_key)
 
-        if TWIN_ONLY:
-            filter_clause = "AND p.B = p.Y + 1"
-        elif PARTITION_MODE:
-            filter_clause = "AND p.B != p.Y + 1"
-        else:
-            filter_clause = ""
+    # 📄 Output message
+    output_path = get_path("text_output", "tagged", TABLE_NAME + "_output.txt")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(f"✅ Motif integer cycles written to `{TABLE_NAME}` for up to n = {INTEGER_MAX}\n")
 
-        cursor.execute(f"""
-            SELECT c.motif_integer, c.cycle
-            FROM motif_cycles c
-            JOIN mi.motif_integers m ON c.motif_integer = m.integer_N
-            JOIN params.motif_parameters p ON m.motif_A = p.A
-            WHERE c.motif_integer <= ?
-            {filter_clause}
-        """, (INTEGER_LIMIT,))
-        rows = cursor.fetchall()
-        conn.close()
+    logger.info("🎉 Motif cycle generation complete.")
 
-        for n, cycle_json in rows:
-            file.write(f"{n}: {json.loads(cycle_json)}\n")
-
-        if missing_motifs:
-            file.write("\n### Missing Collatz Cycles (Not Found in collatz_sequences.db) ###\n")
-            file.write(", ".join(map(str, missing_motifs)) + "\n")
-
-    print(f"✅ Step 4 complete. New cycles saved to `motif_cycles.db` and written to:\n→ {output_file}")
-
+# Entrypoint
 if __name__ == "__main__":
-    process_motif_cycles_ray()
+    process_motif_cycles()
+    ray.shutdown()
