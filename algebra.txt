@@ -1,0 +1,176 @@
+﻿There are two trees.
+
+
+This is how the first tree I found starts.
+
+
+3->5->L=4. 
+
+
+3 increments by 8
+5 increments by 12.
+
+
+(2^k)-1 increments by 2^(k+1).
+3(2^k-1)) increments by 2^(k).
+
+
+This pattern will catch every positive integer 3 modulus 8, and 5 modulus 12. The pattern is always 3+8x, even, 5+12x, even, and then even, even, 4+9x 
+
+
+Note that 
+For all x.
+
+
+This is the first rule for this set of even mersennes. Note that k must = 0mod2. 
+
+
+Now this actually has a higher and more complex structure to it, and this principle is illustrated first with 15 and 23.
+
+
+In this case k = 4.
+
+
+15 increments by 32.
+23 increments by 16.
+
+
+So, same deal for the increment rate.
+
+This pattern will catch every positive integer 15 modulus 32, every third integer 23 modulus 16, and, notably, will always be chained with 3 modulus … something.
+
+
+Let’s try to write it out. 
+
+
+(15, 23, 35, 53, 40). (47, 71, 107, 161, 121). (79, 119, 179, 269, 202).
+
+
+We can write this as 15+32(x), even, 23+48(x), even, 3 + 32 + 72(x), even, 5 + 48 + 108(x), even, even, 4+36+81(x).
+
+
+ The first recurrence in this pattern always has an even L. the second always has an odd L. and then they flip back and forth. 
+
+
+So, before we continue, we’ll always have 15mod32 -> 23mod48-> 35mod72 -> 53mod108->L (even or odd), 40mod81. 
+Ok. Let’s do the next step. 
+
+
+The next pair is 63 and 95.
+63 increments by 128.
+95 increments by 64.
+
+
+We can write this one as 63+128(x), even, 95+192(x), even, 15+128+288(x), even, 23+192+ 432(x), even, 3+32+288+648(x), even, 5+48+432+972(x), even, even, 4+36+324+729(x).
+
+
+For x = 0
+(63, 95, 143, 215, 285, 437, 364)
+(191, 287, 431, 647, 971, 1457, 1093).
+(319, 479, 719, 1079, 1619, 2429, 1822).
+
+
+Ok.
+
+
+So without trying anything else
+I’m gonna write out what the next length of chain is
+255+512(x), even, 383+768(x), even, 63+512+1152(x), even, 95+768+1728(x), even, 15+128+1152+2592(x), even, 23+192+1728+3888(x), even, 3+32+288+2592+5832(x), 5+48+432+3888+8748(x), even, even, 4+36+324+2916+6561(x).
+
+
+NOTE THAT
+
+
+With L, the chain is actually (4*9^0)+(4*9^1)+(4*9^2)+(4*9^3)+(4*9^4)... so the strand always falls on this number, and then is divided by 4 to produce L.
+
+
+Another way to write this would be
+
+
+255+512(x), even, 383+768(x), even, 63+512+1152(x), even, 95+768+1728(x), even, 15+128+1152+2592(x), even, 23+192+1728+3888(x), even, 3+32+288+2592+5832(x), 5+48+432+3888+8748(x), (4*9^0)+(4*9^1)+(4*9^2)+(4*9^3)+(4*9^4)(x), even, (4*9^0)+(4*9^1)+(4*9^2)+(4*9^3)+(9^4)(x).
+
+
+See what I mean?
+
+
+I can articulate the specific rules of expansion and turn this into a simple algebraic rule I think. 
+
+
+
+
+Next question.
+
+
+Is 7 indicative of: 3mod4, or 7mod8?
+Likewise is 11 from 5mod6, or from 11mod12?
+
+
+Is it possible that this is actually just powers of 4, and k = 0mod2 is universal?
+
+
+Why don’t we consider it a feature of 3mod4. 
+
+
+I think the reason why we wouldn’t is that the patterning is different. 
+
+OK.
+
+
+We’ll do 7mod8, with the understanding that the numbers are just offset from the smaller modulus if that makes sense. 
+
+
+The pattern I see for this one is 
+
+
+7+8x, even, 11+12x, even, 17+18x, even, even, 13 
+
+
+This isn’t mutually exclusive with the other tree. 
+
+
+Note how the next instance is 15, even, 23, even, 35, even, [53], …
+Which is from the other tree.
+
+
+Let’s try another.
+22, even, 35, even, 53, even, even, 40.
+
+
+Hmm.
+I think these odd mersennes are attracted into the same sink of the evens.
+
+
+29 is the second of (19, 29)... to 22.
+Also violates the 11+12x rule, so that doesn’t work.
+
+
+They seem like they might not ever be too far from this chain, but I’m not seeing any clear order in what’s presented.  
+Interesting. 
+Good to rule out.
+
+
+I think I was looking at 3mod4 last time.
+
+
+So that would be 3+4x, 5+6x, and then L is 4+9x.
+
+
+(3, 5, 4)
+(7, 11, 17, 13)
+(11, 17, 13)
+(15, 23, 35, 53, 40)
+(19, 29, 22)
+
+
+I think it’d be interesting to see if I can find some sort of structural regularity with the odd mersennes.
+
+
+I still think what I have is capable of maybe catching all the OEOE… chains without me extrapolating it. 
+
+
+I need a counterexample.
+
+
+
+
+An inductive definition that says "given chain depth n, the depth n+1 chain is [this transformation applied to the depth n chain]"
